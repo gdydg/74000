@@ -92,14 +92,17 @@ def decode_stream_from_id(raw_id):
     except Exception:
         return None
 
-def get_keep_start(now, tz):
-    """保留窗口起点：前一天 20:00:00。"""
+def get_keep_window(now, tz):
+    """保留窗口：前一天 20:00:00 到当天 23:59:59。"""
     yesterday = (now - timedelta(days=1)).date()
-    return tz.localize(datetime.combine(yesterday, datetime.min.time().replace(hour=20)))
+    today = now.date()
+    keep_start = tz.localize(datetime.combine(yesterday, datetime.min.time().replace(hour=20)))
+    keep_end = tz.localize(datetime.combine(today, datetime.max.time().replace(microsecond=0)))
+    return keep_start, keep_end
 
 def load_existing_records(now, tz):
     """加载历史成功记录，并按照保留窗口过滤。"""
-    keep_start = get_keep_start(now, tz)
+    keep_start, keep_end = get_keep_window(now, tz)
     records = []
     if os.path.exists(OUTPUT_FILE):
         with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
@@ -114,7 +117,7 @@ def load_existing_records(now, tz):
                         continue
                     match_time = datetime.strptime(item_match_time, "%Y-%m-%d %H:%M:%S")
                     match_time = tz.localize(match_time)
-                    if match_time >= keep_start and item.get("source_url") and item.get("stream_url"):
+                    if keep_start <= match_time <= keep_end and item.get("source_url") and item.get("stream_url"):
                         records.append(item)
                 except Exception:
                     continue
@@ -143,7 +146,7 @@ def scrape_job():
 
     # 存储比赛基础信息：match_id -> info_dict
     match_infos = {} 
-    keep_start = get_keep_start(now, tz)
+    keep_start, keep_end = get_keep_window(now, tz)
 
     for a in soup.select('a.clearfix'):
         href = a.get('href')
@@ -154,8 +157,8 @@ def scrape_job():
                     time_str += " 00:00:00"
                 match_time = tz.localize(datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S'))
                 
-                # 仅保留前一天20点后到当前的赛事
-                if match_time >= keep_start:
+                # 仅保留前一天20点到当天23:59:59的赛事
+                if keep_start <= match_time <= keep_end:
                     match_id = href.split('/')[-1]
                     
                     # 提取联赛名、对阵双方和显示时间
