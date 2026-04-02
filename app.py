@@ -145,8 +145,10 @@ def scrape_job():
         return
 
     # 存储比赛基础信息：match_id -> info_dict
-    match_infos = {} 
-    keep_start, keep_end = get_keep_window(now, tz)
+    match_infos = {}
+    # 抓取窗口：前4小时到后1小时（仅影响本轮抓取范围）
+    lower_bound = now - timedelta(hours=4)
+    upper_bound = now + timedelta(hours=1)
 
     for a in soup.select('a.clearfix'):
         href = a.get('href')
@@ -157,8 +159,8 @@ def scrape_job():
                     time_str += " 00:00:00"
                 match_time = tz.localize(datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S'))
                 
-                # 仅保留前一天20点到当天23:59:59的赛事
-                if keep_start <= match_time <= keep_end:
+                # 抓取窗口：前4小时到后1小时
+                if lower_bound <= match_time <= upper_bound:
                     match_id = href.split('/')[-1]
                     
                     # 提取联赛名、对阵双方和显示时间
