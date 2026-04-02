@@ -13,6 +13,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 OUTPUT_FILE = 'output/extracted_ids.txt'
+ROUTE_STATE_FILE = 'output/decoded_routes.jsonl'
 LAST_RUN_TIME = "尚未执行"
 
 # ==========================================
@@ -123,6 +124,35 @@ def load_existing_records(now, tz):
                     continue
     return records
 
+def load_route_states(now, tz):
+    """加载线路解密状态，并清理保留窗口外数据。"""
+    keep_start, keep_end = get_keep_window(now, tz)
+    states = {}
+    if os.path.exists(ROUTE_STATE_FILE):
+        with open(ROUTE_STATE_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                    source_url = item.get("source_url")
+                    match_time_str = item.get("match_time")
+                    if not source_url or not match_time_str:
+                        continue
+                    match_time = tz.localize(datetime.strptime(match_time_str, "%Y-%m-%d %H:%M:%S"))
+                    if keep_start <= match_time <= keep_end:
+                        states[source_url] = item
+                except Exception:
+                    continue
+    return states
+
+def save_route_states(states):
+    os.makedirs('output', exist_ok=True)
+    with open(ROUTE_STATE_FILE, 'w', encoding='utf-8') as f:
+        for item in states.values():
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
 # ==========================================
 # 爬虫任务逻辑
 # ==========================================
@@ -207,12 +237,54 @@ def scrape_job():
 
     # 已有成功记录（带 source_url + stream_url）可直接复用，不重复抓取
     existing_records = load_existing_records(now, tz)
-    final_data = list(existing_records)
-    success_by_source_url = {item["source_url"] for item in existing_records}
+    route_states = load_route_states(now, tz)
+
+    # 维护线路状态：保留窗口内的历史状态 + 本轮最新线路
+    for url, info in play_url_to_info.items():
+        old = route_states.get(url, {})
+        route_states[url] = {
+            "source_url": url,
+            "match_time": info["match_time"],
+            "time": info["time"],
+            "league": info["league"],
+            "home": info["home"],
+            "away": info["away"],
+            "resolved": old.get("resolved", False),
+            "id": old.get("id"),
+            "stream_url": old.get("stream_url")
+        }
+
+    # 用线路状态文件中的 resolved 标记控制是否跳过抓取
+    success_by_source_url = {
+        source_url for source_url, state in route_states.items()
+        if state.get("resolved") and state.get("stream_url")
+    }
+
+    # 优先从线路状态恢复成功记录，避免 output 文件偶发缺失导致重复抓取
+    final_data = []
+    for source_url in success_by_source_url:
+        state = route_states[source_url]
+        if state.get("id") and state.get("stream_url"):
+            final_data.append({
+                'id': state["id"],
+                'source_url': source_url,
+                'stream_url': state["stream_url"],
+                'match_time': state["match_time"],
+                'time': state["time"],
+                'league': state["league"],
+                'home': state["home"],
+                'away': state["away"]
+            })
+
+    # 兼容保留 output 中成功记录（去重合并）
+    for item in existing_records:
+        if item["source_url"] not in success_by_source_url:
+            final_data.append(item)
+            success_by_source_url.add(item["source_url"])
     seen_ids = set()
     seen_source_urls = set(success_by_source_url)
 
-    for item in existing_records:
+    for item in final_data:
         if item.get("id"):
             seen_ids.add(item["id"])
 
@@ -234,6 +306,9 @@ def scrape_job():
                             stream_url = decode_stream_from_id(extracted_id)
                             if stream_url:
                                 # 仅当成功解密出直播源时才视为成功，下次可跳过
+                                route_states[url]["resolved"] = True
+                                route_states[url]["id"] = extracted_id
+                                route_states[url]["stream_url"] = stream_url
                                 final_data.append({
                                     'id': extracted_id,
                                     'source_url': url,
@@ -256,6 +331,7 @@ def scrape_job():
         # 按行写入 JSON，方便带上比赛信息供接口读取
         for item in final_data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
+    save_route_states(route_states)
     print(f"任务完成，共保存 {len(final_data)} 个独立字符。")
 
 # ==========================================
