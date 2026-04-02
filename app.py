@@ -74,6 +74,52 @@ def xxtea_decrypt(data, key):
         
     return long2str(v, True)
 
+def decode_stream_from_id(raw_id):
+    """将抓取到的 ID 解密为直播源 URL，失败返回 None。"""
+    target_key = b"ABCDEFGHIJKLMNOPQRSTUVWX"
+    try:
+        decoded_id = urllib.parse.unquote(raw_id)
+        pad = 4 - (len(decoded_id) % 4)
+        if pad != 4:
+            decoded_id += "=" * pad
+        bin_data = base64.b64decode(decoded_id)
+        decrypted_bytes = xxtea_decrypt(bin_data, target_key)
+        if not decrypted_bytes:
+            return None
+        json_str = decrypted_bytes.decode('utf-8', errors='ignore')
+        data = json.loads(json_str)
+        return data.get("url")
+    except Exception:
+        return None
+
+def get_keep_start(now, tz):
+    """保留窗口起点：前一天 20:00:00。"""
+    yesterday = (now - timedelta(days=1)).date()
+    return tz.localize(datetime.combine(yesterday, datetime.min.time().replace(hour=20)))
+
+def load_existing_records(now, tz):
+    """加载历史成功记录，并按照保留窗口过滤。"""
+    keep_start = get_keep_start(now, tz)
+    records = []
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or not line.startswith('{'):
+                    continue
+                try:
+                    item = json.loads(line)
+                    item_match_time = item.get("match_time")
+                    if not item_match_time:
+                        continue
+                    match_time = datetime.strptime(item_match_time, "%Y-%m-%d %H:%M:%S")
+                    match_time = tz.localize(match_time)
+                    if match_time >= keep_start and item.get("source_url") and item.get("stream_url"):
+                        records.append(item)
+                except Exception:
+                    continue
+    return records
+
 # ==========================================
 # 爬虫任务逻辑
 # ==========================================
@@ -97,10 +143,7 @@ def scrape_job():
 
     # 存储比赛基础信息：match_id -> info_dict
     match_infos = {} 
-    
-    # 定义时间窗口：当前时间前 4 小时 到 后 1 小时
-    lower_bound = now - timedelta(hours=4)
-    upper_bound = now + timedelta(hours=1)
+    keep_start = get_keep_start(now, tz)
 
     for a in soup.select('a.clearfix'):
         href = a.get('href')
@@ -111,8 +154,8 @@ def scrape_job():
                     time_str += " 00:00:00"
                 match_time = tz.localize(datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S'))
                 
-                # 判断比赛时间是否在允许的时间窗口内
-                if lower_bound <= match_time <= upper_bound:
+                # 仅保留前一天20点后到当前的赛事
+                if match_time >= keep_start:
                     match_id = href.split('/')[-1]
                     
                     # 提取联赛名、对阵双方和显示时间
@@ -129,6 +172,7 @@ def scrape_job():
                     display_time = time_i_tag.text.strip() if time_i_tag else match_time.strftime('%H:%M')
                     
                     match_infos[match_id] = {
+                        'match_time': match_time.strftime('%Y-%m-%d %H:%M:%S'),
                         'time': display_time,
                         'league': league, # 依然保留抓取，防止未来需要
                         'home': home,
@@ -156,12 +200,24 @@ def scrape_job():
         except Exception as e:
             continue
 
-    final_data = []
+    # 已有成功记录（带 source_url + stream_url）可直接复用，不重复抓取
+    existing_records = load_existing_records(now, tz)
+    final_data = list(existing_records)
+    success_by_source_url = {item["source_url"] for item in existing_records}
     seen_ids = set()
+    seen_source_urls = set(success_by_source_url)
+
+    for item in existing_records:
+        if item.get("id"):
+            seen_ids.add(item["id"])
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         page = browser.new_page()
         for url, info in play_url_to_info.items():
+            if url in success_by_source_url:
+                # 上次已经成功解密到直播源，这条线路本次跳过
+                continue
             try:
                 requests_list = []
                 page.on("request", lambda request: requests_list.append(request.url))
@@ -169,16 +225,22 @@ def scrape_job():
                 for req_url in requests_list:
                     if 'paps.html?id=' in req_url:
                         extracted_id = req_url.split('paps.html?id=')[-1]
-                        if extracted_id not in seen_ids:
-                            # 将 ID 和赛事信息打包成字典
-                            final_data.append({
-                                'id': extracted_id,
-                                'time': info['time'],
-                                'league': info['league'],
-                                'home': info['home'],
-                                'away': info['away']
-                            })
-                            seen_ids.add(extracted_id)
+                        if extracted_id not in seen_ids and url not in seen_source_urls:
+                            stream_url = decode_stream_from_id(extracted_id)
+                            if stream_url:
+                                # 仅当成功解密出直播源时才视为成功，下次可跳过
+                                final_data.append({
+                                    'id': extracted_id,
+                                    'source_url': url,
+                                    'stream_url': stream_url,
+                                    'match_time': info['match_time'],
+                                    'time': info['time'],
+                                    'league': info['league'],
+                                    'home': info['home'],
+                                    'away': info['away']
+                                })
+                                seen_ids.add(extracted_id)
+                                seen_source_urls.add(url)
                         break
             except Exception:
                 continue
@@ -201,8 +263,6 @@ def generate_playlist(fmt="m3u", mode="clean"):
     with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
     
-    target_key = b"ABCDEFGHIJKLMNOPQRSTUVWX"
-    
     # 根据格式初始化头部
     if fmt == "m3u":
         content = "#EXTM3U\n"
@@ -216,48 +276,28 @@ def generate_playlist(fmt="m3u", mode="clean"):
             # 兼容处理判断是新版的 JSON 还是旧版的纯文本 ID
             if line.startswith('{'):
                 item = json.loads(line)
-                raw_id = item['id']
                 # 拼接频道名：19:35 福建VS辽宁
                 channel_name = f"{item['time']} {item['home']}VS{item['away']}"
                 # 分组名固定为体育直播
                 group_title = "体育直播"
+                stream_url = item.get("stream_url")
             else:
-                raw_id = line
                 channel_name = f"体育直播 {index}"
                 group_title = "体育直播"
+                stream_url = decode_stream_from_id(line)
 
-            decoded_id = urllib.parse.unquote(raw_id)
-            pad = 4 - (len(decoded_id) % 4)
-            if pad != 4: decoded_id += "=" * pad
-                
-            bin_data = base64.b64decode(decoded_id)
-            decrypted_bytes = xxtea_decrypt(bin_data, target_key)
-            
-            if decrypted_bytes:
-                json_str = decrypted_bytes.decode('utf-8', errors='ignore')
-                data = json.loads(json_str)
-                
-                if 'url' in data:
-                    # 如果是旧版纯 ID 数据，尝试降级使用接口自带的 title
-                    if not line.startswith('{'):
-                         channel_name = data.get('name') or data.get('title') or channel_name
+            if stream_url:
+                if mode == "plus":
+                    # plus 模式下追加空的 Referer
+                    stream_url = f"{stream_url}|Referer="
 
-                    raw_stream_url = data["url"]
-                    
-                    if mode == "plus":
-                        # plus 模式下追加空的 Referer
-                        stream_url = f"{raw_stream_url}|Referer="
-                    else:
-                        # clean 模式下（如 /m3u）保持纯净原地址
-                        stream_url = raw_stream_url
-                    
-                    # 严格按照格式拼接
-                    if fmt == "m3u":
-                        content += f'#EXTINF:-1 group-title="{group_title}",{channel_name}\n{stream_url}\n'
-                    else:
-                        content += f'{channel_name},{stream_url}\n'
-                        
-                    index += 1
+                # 严格按照格式拼接
+                if fmt == "m3u":
+                    content += f'#EXTINF:-1 group-title="{group_title}",{channel_name}\n{stream_url}\n'
+                else:
+                    content += f'{channel_name},{stream_url}\n'
+
+                index += 1
         except Exception:
             continue
             
