@@ -343,45 +343,6 @@ def generate_playlist(fmt="m3u", mode="clean"):
         
     with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
-
-    parsed_items = []
-    for line in lines:
-        try:
-            if line.startswith('{'):
-                item = json.loads(line)
-                stream_url = item.get("stream_url")
-                if not stream_url:
-                    continue
-                parsed_items.append({
-                    "is_json": True,
-                    "item": item,
-                    "stream_url": stream_url
-                })
-            else:
-                stream_url = decode_stream_from_id(line)
-                if not stream_url:
-                    continue
-                parsed_items.append({
-                    "is_json": False,
-                    "raw_id": line,
-                    "stream_url": stream_url
-                })
-        except Exception:
-            continue
-
-    # /m3u 按比赛时间倒序输出（越晚越靠上）
-    if fmt == "m3u":
-        def sort_key(entry):
-            if not entry["is_json"]:
-                return datetime.min
-            match_time_str = entry["item"].get("match_time")
-            if not match_time_str:
-                return datetime.min
-            try:
-                return datetime.strptime(match_time_str, "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return datetime.min
-        parsed_items.sort(key=sort_key, reverse=True)
     
     # 根据格式初始化头部
     if fmt == "m3u":
@@ -390,32 +351,21 @@ def generate_playlist(fmt="m3u", mode="clean"):
         content = "体育直播,#genre#\n"
         
     index = 1
-    route_index_by_match = {}
-
-    for entry in parsed_items:
+    
+    for line in lines:
         try:
-            if entry["is_json"]:
-                item = entry["item"]
+            # 兼容处理判断是新版的 JSON 还是旧版的纯文本 ID
+            if line.startswith('{'):
+                item = json.loads(line)
+                # 拼接频道名：19:35 福建VS辽宁
+                channel_name = f"{item['time']} {item['home']}VS{item['away']}"
                 # 分组名固定为体育直播
                 group_title = "体育直播"
-                stream_url = entry["stream_url"]
-
-                # 同一场比赛不同线路用 1/2/3/4... 区分（仅 m3u）
-                if fmt == "m3u":
-                    match_key = (
-                        item.get("match_time", ""),
-                        item.get("home", ""),
-                        item.get("away", "")
-                    )
-                    route_index_by_match[match_key] = route_index_by_match.get(match_key, 0) + 1
-                    route_index = route_index_by_match[match_key]
-                    channel_name = f"{item['time']} {item['home']}VS{item['away']} {route_index}"
-                else:
-                    channel_name = f"{item['time']} {item['home']}VS{item['away']}"
+                stream_url = item.get("stream_url")
             else:
                 channel_name = f"体育直播 {index}"
                 group_title = "体育直播"
-                stream_url = entry["stream_url"]
+                stream_url = decode_stream_from_id(line)
 
             if stream_url:
                 if mode == "plus":
