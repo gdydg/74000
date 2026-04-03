@@ -209,7 +209,7 @@ def scrape_job():
                     match_infos[match_id] = {
                         'match_time': match_time.strftime('%Y-%m-%d %H:%M:%S'),
                         'time': display_time,
-                        'league': league, # 依然保留抓取，防止未来需要
+                        'league': league, 
                         'home': home,
                         'away': away
                     }
@@ -293,7 +293,6 @@ def scrape_job():
         page = browser.new_page()
         for url, info in play_url_to_info.items():
             if url in success_by_source_url:
-                # 上次已经成功解密到直播源，这条线路本次跳过
                 continue
             try:
                 requests_list = []
@@ -305,7 +304,6 @@ def scrape_job():
                         if extracted_id not in seen_ids and url not in seen_source_urls:
                             stream_url = decode_stream_from_id(extracted_id)
                             if stream_url:
-                                # 仅当成功解密出直播源时才视为成功，下次可跳过
                                 route_states[url]["resolved"] = True
                                 route_states[url]["id"] = extracted_id
                                 route_states[url]["stream_url"] = stream_url
@@ -328,11 +326,10 @@ def scrape_job():
 
     os.makedirs('output', exist_ok=True)
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        # 按行写入 JSON，方便带上比赛信息供接口读取
         for item in final_data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
     save_route_states(route_states)
-    print(f"任务完成，共保存 {len(final_data)} 个独立字符。")
+    print(f"任务完成，共保存 {len(final_data)} 个独立记录。")
 
 # ==========================================
 # 统一的播放列表生成逻辑 (支持 M3U 和 TXT)
@@ -344,43 +341,70 @@ def generate_playlist(fmt="m3u", mode="clean"):
     with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
     
+    parsed_items = []
+    old_format_items = [] 
+    
+    # 1. 遍历读取数据并分类
+    for line in lines:
+        try:
+            if line.startswith('{'):
+                item = json.loads(line)
+                parsed_items.append(item)
+            else:
+                stream_url = decode_stream_from_id(line)
+                if stream_url:
+                    old_format_items.append(stream_url)
+        except Exception:
+            continue
+
+    # 2. 核心逻辑：按照 match_time 降序排序（时间越晚字符串越大，排在越前面）
+    parsed_items.sort(key=lambda x: x.get('match_time', '1970-01-01 00:00:00'), reverse=True)
+
     # 根据格式初始化头部
     if fmt == "m3u":
         content = "#EXTM3U\n"
     else:
         content = "体育直播,#genre#\n"
         
-    index = 1
+    # 用于记录每场比赛当前分配到了第几条线路
+    match_route_counter = {}
     
-    for line in lines:
-        try:
-            # 兼容处理判断是新版的 JSON 还是旧版的纯文本 ID
-            if line.startswith('{'):
-                item = json.loads(line)
-                # 拼接频道名：19:35 福建VS辽宁
-                channel_name = f"{item['time']} {item['home']}VS{item['away']}"
-                # 分组名固定为体育直播
-                group_title = "体育直播"
-                stream_url = item.get("stream_url")
-            else:
-                channel_name = f"体育直播 {index}"
-                group_title = "体育直播"
-                stream_url = decode_stream_from_id(line)
-
-            if stream_url:
-                if mode == "plus":
-                    # plus 模式下追加空的 Referer
-                    stream_url = f"{stream_url}|Referer="
-
-                # 严格按照格式拼接
-                if fmt == "m3u":
-                    content += f'#EXTINF:-1 group-title="{group_title}",{channel_name}\n{stream_url}\n'
-                else:
-                    content += f'{channel_name},{stream_url}\n'
-
-                index += 1
-        except Exception:
+    # 3. 处理排序后的新版 JSON 数据
+    for item in parsed_items:
+        stream_url = item.get("stream_url")
+        if not stream_url:
             continue
+
+        base_name = f"{item.get('time', '')} {item.get('home', '')}VS{item.get('away', '')}".strip()
+        
+        # 统计该比赛出现的次数，用于分配后缀 1, 2, 3...
+        match_route_counter[base_name] = match_route_counter.get(base_name, 0) + 1
+        route_index = match_route_counter[base_name]
+        
+        # 拼接最终频道名：19:35 福建VS辽宁-1
+        channel_name = f"{base_name}-{route_index}"
+        group_title = "体育直播"
+
+        if mode == "plus":
+            stream_url = f"{stream_url}|Referer="
+
+        if fmt == "m3u":
+            content += f'#EXTINF:-1 group-title="{group_title}",{channel_name}\n{stream_url}\n'
+        else:
+            content += f'{channel_name},{stream_url}\n'
+
+    # 4. （可选保留）处理旧版未包含时间信息的兜底数据追加到最末尾
+    old_index = 1
+    for stream_url in old_format_items:
+        channel_name = f"体育直播 {old_index}"
+        if mode == "plus":
+            stream_url = f"{stream_url}|Referer="
+        
+        if fmt == "m3u":
+            content += f'#EXTINF:-1 group-title="体育直播",{channel_name}\n{stream_url}\n'
+        else:
+            content += f'{channel_name},{stream_url}\n'
+        old_index += 1
             
     return content
 
