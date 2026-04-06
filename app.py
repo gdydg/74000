@@ -93,6 +93,64 @@ def decode_stream_from_id(raw_id):
     except Exception:
         return None
 
+def normalize_route_text(text):
+    """归一化线路文本，便于匹配“信1/信①/信号”等变体。"""
+    if not text:
+        return ""
+    return re.sub(r'\s+', '', text.strip())
+
+def pick_signal_label(dd):
+    """
+    从线路节点中选择“带有信字”的标签。
+    只要任一 span.diss 文本包含“信”即视为目标线路。
+    """
+    labels = [normalize_route_text(span.get_text()) for span in dd.select('span.diss')]
+    labels = [label for label in labels if label]
+    for label in labels:
+        if '信' in label:
+            return label
+    return None
+
+def extract_paps_ids_from_text(text):
+    """从文本中提取 paps.html?id= 后面的 id。"""
+    if not text:
+        return []
+    return re.findall(r'paps\.html\?id=([^"\'&\s]+)', text)
+
+def collect_paps_ids_from_page_assets(page):
+    """
+    从网页资产文件路径中提取 paps.html?id=... 的 id：
+    仅扫描 src/href/data-src 等资源路径本身，不解析页面源码和 JS 文件内容。
+    """
+    ids = set()
+
+    try:
+        assets = page.evaluate("""
+            () => {
+                const out = [];
+                document.querySelectorAll('[src],[href],[data-src]').forEach(el => {
+                    const src = el.getAttribute('src');
+                    const href = el.getAttribute('href');
+                    const dataSrc = el.getAttribute('data-src');
+                    if (src) out.push(src);
+                    if (href) out.push(href);
+                    if (dataSrc) out.push(dataSrc);
+                });
+                return out;
+            }
+        """)
+    except Exception:
+        assets = []
+
+    for raw in assets:
+        if not raw or raw.startswith('javascript:'):
+            continue
+        abs_url = urllib.parse.urljoin(page.url, raw)
+        for item in extract_paps_ids_from_text(abs_url):
+            ids.add(item)
+
+    return list(ids)
+
 def get_keep_window(now, tz):
     """保留窗口：前一天 20:00:00 到当天 23:59:59。"""
     yesterday = (now - timedelta(days=1)).date()
@@ -214,7 +272,7 @@ def scrape_job():
             except Exception:
                 continue
 
-    # 存储内页原始播放链接映射：play_url -> info_dict
+    # 存储内页原始播放链接映射：play_url -> info_dict（仅保留带“信”线路）
     play_url_to_info = {}
     for match_id, info in match_infos.items():
         link = f"https://www.74001.tv/live/{match_id}"
@@ -222,6 +280,9 @@ def scrape_job():
             res = requests.get(link, headers=headers, timeout=10)
             soup = BeautifulSoup(res.text, 'html.parser')
             for dd in soup.select('dd[nz-g-c]'):
+                signal_label = pick_signal_label(dd)
+                if not signal_label:
+                    continue
                 b64_str = dd.get('nz-g-c')
                 if b64_str:
                     decoded = base64.b64decode(b64_str).decode('utf-8', errors='ignore')
@@ -229,7 +290,9 @@ def scrape_job():
                     if m:
                         raw_url = m.group(1)
                         url = 'http://' + raw_url.replace('!', '.').replace('&nbsp', 'com').replace('*', '/')
-                        play_url_to_info[url] = info
+                        info_with_route = dict(info)
+                        info_with_route['route_label'] = signal_label
+                        play_url_to_info[url] = info_with_route
         except Exception as e:
             continue
 
@@ -245,6 +308,7 @@ def scrape_job():
             "league": info["league"],
             "home": info["home"],
             "away": info["away"],
+            "route_label": info.get("route_label", ""),
             "resolved": old.get("resolved", False),
             "id": old.get("id"),
             "stream_url": old.get("stream_url")
@@ -267,7 +331,8 @@ def scrape_job():
                 'time': state["time"],
                 'league': state["league"],
                 'home': state["home"],
-                'away': state["away"]
+                'away': state["away"],
+                'route_label': state.get("route_label", "")
             })
 
     for item in existing_records:
@@ -304,32 +369,32 @@ def scrape_job():
             page = context.new_page()
             
             try:
-                requests_list = []
-                # 绑定到新的独立 page 上
-                page.on("request", lambda request: requests_list.append(request.url))
                 page.goto(url, wait_until='networkidle', timeout=15000)
+                page.wait_for_timeout(1500)
+                # 仅从源码/资产路径抽取 id（不再监听 request）
+                candidate_ids = collect_paps_ids_from_page_assets(page)
                 
-                for req_url in requests_list:
-                    if 'paps.html?id=' in req_url:
-                        extracted_id = req_url.split('paps.html?id=')[-1]
-                        if extracted_id not in seen_ids and url not in seen_source_urls:
-                            stream_url = decode_stream_from_id(extracted_id)
-                            if stream_url:
-                                route_states[url]["resolved"] = True
-                                route_states[url]["id"] = extracted_id
-                                route_states[url]["stream_url"] = stream_url
-                                final_data.append({
-                                    'id': extracted_id,
-                                    'source_url': url,
-                                    'stream_url': stream_url,
-                                    'match_time': info['match_time'],
-                                    'time': info['time'],
-                                    'league': info['league'],
-                                    'home': info['home'],
-                                    'away': info['away']
-                                })
-                                seen_ids.add(extracted_id)
-                                seen_source_urls.add(url)
+                for extracted_id in candidate_ids:
+                    if extracted_id not in seen_ids and url not in seen_source_urls:
+                        stream_url = decode_stream_from_id(extracted_id)
+                        if stream_url:
+                            route_states[url]["resolved"] = True
+                            route_states[url]["id"] = extracted_id
+                            route_states[url]["stream_url"] = stream_url
+                            final_data.append({
+                                'id': extracted_id,
+                                'source_url': url,
+                                'stream_url': stream_url,
+                                'match_time': info['match_time'],
+                                'time': info['time'],
+                                'league': info['league'],
+                                'home': info['home'],
+                                'away': info['away'],
+                                'route_label': info.get('route_label', '')
+                            })
+                            seen_ids.add(extracted_id)
+                            seen_source_urls.add(url)
+                    if url in seen_source_urls:
                         break
             except Exception as e:
                 print(f"解析页面失败 {url}: {e}")
