@@ -247,8 +247,21 @@ def scrape_job():
             "away": info["away"],
             "resolved": old.get("resolved", False),
             "id": old.get("id"),
-            "stream_url": old.get("stream_url")
+            "stream_url": old.get("stream_url"),
+            "refresh_cycle_count": old.get("refresh_cycle_count", 0)
         }
+
+    urls_due_for_refresh = set()
+    for source_url, state in route_states.items():
+        if state.get("resolved") and state.get("stream_url"):
+            state["refresh_cycle_count"] = state.get("refresh_cycle_count", 0) + 1
+            if state["refresh_cycle_count"] >= 3:
+                # 规则：隔两次抓取后，第 3 次强制重抓并替换
+                state["refresh_cycle_count"] = 0
+                state["resolved"] = False
+                state["id"] = None
+                state["stream_url"] = None
+                urls_due_for_refresh.add(source_url)
 
     success_by_source_url = {
         source_url for source_url, state in route_states.items()
@@ -271,7 +284,7 @@ def scrape_job():
             })
 
     for item in existing_records:
-        if item["source_url"] not in success_by_source_url:
+        if item["source_url"] not in success_by_source_url and item["source_url"] not in urls_due_for_refresh:
             final_data.append(item)
             success_by_source_url.add(item["source_url"])
             
@@ -318,6 +331,7 @@ def scrape_job():
                                 route_states[url]["resolved"] = True
                                 route_states[url]["id"] = extracted_id
                                 route_states[url]["stream_url"] = stream_url
+                                route_states[url]["refresh_cycle_count"] = 0
                                 final_data.append({
                                     'id': extracted_id,
                                     'source_url': url,
